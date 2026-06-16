@@ -220,7 +220,7 @@ TRANSIENT_PATTERNS = re.compile(
 )
 
 LOW_SIGNAL_PATTERNS = re.compile(
-    r"^(consider|maybe|possibly|think about|note:|michael may|regina may)\b",
+    r"^(consider|maybe|possibly|think about|note:|someone may)\b",
     re.IGNORECASE,
 )
 
@@ -277,9 +277,9 @@ SYSTEM_PROMPT = """You are an accountability assistant analyzing transcripts fro
 The transcript is the source of truth. The Bee summary is context only. Do not create or complete tasks
 from the summary unless the transcript also contains direct evidence.
 
-Your main failure mode to avoid: merging adjacent but unrelated facts. If Harold recommends a nanny,
-Eugenia is discussed elsewhere as a doula, and $65/hour appears nearby, do NOT combine those facts unless
-the transcript explicitly says they are the same person/recommendation/rate.
+Your main failure mode to avoid: merging adjacent but unrelated facts. If one person recommends a
+service, a different person is discussed elsewhere, and a price appears nearby, do NOT combine those
+facts unless the transcript explicitly says they are the same person/recommendation/rate.
 
 COMPLETED tasks — mark done ONLY if the transcript contains direct evidence: past tense confirmation
 ("I did X", "done", "finished"), someone confirming completion, or the action clearly happening now.
@@ -289,7 +289,7 @@ Do not include names, prices, dates, or relationships unless the evidence quote 
 
 Reject:
 - vague ideas, brainstorming, jokes, or notes-to-self without commitment
-- generic baby-care guidance or transient reminders ("later today", "when Regina gets back")
+- generic baby-care guidance or transient reminders ("later today", "when a family member gets back")
 - inferred tasks based only on proximity of topics
 - tasks where the task text depends on unsupported details
 
@@ -389,7 +389,7 @@ def notify(title: str, message: str) -> None:
 
 
 def send_telegram(text: str) -> None:
-    """Push a message to Michael's phone via the Telegram Bot API.
+    """Push a message to the user's phone via the Telegram Bot API.
 
     No-op (silently) unless both TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID are set
     in .env. Failures never break the run — the desktop notify still fires.

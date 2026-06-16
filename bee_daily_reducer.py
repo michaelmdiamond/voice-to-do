@@ -177,7 +177,7 @@ def item_key(s: str) -> str:
 
 
 LOW_SIGNAL_PATTERNS = re.compile(
-    r"^(consider|maybe|possibly|think about|note:|michael may|regina may)\b",
+    r"^(consider|maybe|possibly|think about|note:|someone may)\b",
     re.IGNORECASE,
 )
 TRANSIENT_PATTERNS = re.compile(

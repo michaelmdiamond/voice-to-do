@@ -141,7 +141,7 @@ launchctl load ~/Library/LaunchAgents/com.michael.bee-daily-reducer.plist
 [full Bee summary]
 
 ## Today's Action Items
-- [ ] Feed Julian within the next 30 minutes or so
+- [ ] Feed the baby within the next 30 minutes or so
 - [ ] Consider researching DIY digital photo frame setup
 ```
 
