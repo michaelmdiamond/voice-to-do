@@ -1,0 +1,31 @@
+# ─────────────────────────────────────────────────────────────────
+# PRIVACY: never commit captured data or secrets.
+# This repo tracks CODE only. Everything the Bee pipeline produces
+# from ambient audio stays local and out of git history.
+# ─────────────────────────────────────────────────────────────────
+
+# Secrets
+.env
+.env.*
+
+# Captured / derived personal data (raw transcripts, extracted tasks, decisions)
+.bee_transcripts/
+.bee_candidates/
+.bee_decisions/
+
+# Pipeline runtime state
+.bee_agent_state.json
+.bee_agent_state.json.backup-*
+
+# Logs
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# macOS
+.DS_Store
