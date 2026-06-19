@@ -24,7 +24,7 @@ from zoneinfo import ZoneInfo
 BEE_BASE      = "http://127.0.0.1:8787"
 TODOIST_BASE  = "https://api.todoist.com/api/v1"
 BEE_LABEL     = "bee"           # Todoist label applied to all bee-sourced tasks
-VAULT         = Path("/Users/michael/Documents/Obsidian Vault")
+VAULT         = Path("/Users/michael/Obsidian Vault")
 DAILY_NOTES   = VAULT / "Daily Notes"
 
 

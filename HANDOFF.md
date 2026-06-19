@@ -33,14 +33,14 @@ If you marked something done in Todoist from your phone at 2pm, by 2:30pm the ag
 
 | File | Location | Purpose |
 |------|----------|---------|
-| `bee_to_obsidian.py` | `~/Documents/GitHub/knowledge/` | Writes daily Obsidian notes |
-| `bee_agent.py` | `~/Documents/GitHub/knowledge/` | Accountability agent |
-| `bee_daily_reducer.py` | `~/Documents/GitHub/knowledge/` | Context-aware staged candidate reducer |
-| `.env` | `~/Documents/GitHub/knowledge/` | Todoist API token (gitignored) |
-| `.bee_agent_state.json` | `~/Documents/GitHub/knowledge/` | Tracks last-processed conversation |
-| `.bee_candidates/` | `~/Documents/GitHub/knowledge/` | JSONL staged candidate tasks by date |
-| `.bee_decisions/` | `~/Documents/GitHub/knowledge/` | Daily reducer decisions and audit trail |
-| Daily notes | `~/Documents/Obsidian Vault/Daily Notes/YYYY-MM-DD.md` | Output |
+| `bee_to_obsidian.py` | `~/GitHub/knowledge/` | Writes daily Obsidian notes |
+| `bee_agent.py` | `~/GitHub/knowledge/` | Accountability agent |
+| `bee_daily_reducer.py` | `~/GitHub/knowledge/` | Context-aware staged candidate reducer |
+| `.env` | `~/GitHub/knowledge/` | Todoist API token (gitignored) |
+| `.bee_agent_state.json` | `~/GitHub/knowledge/` | Tracks last-processed conversation |
+| `.bee_candidates/` | `~/GitHub/knowledge/` | JSONL staged candidate tasks by date |
+| `.bee_decisions/` | `~/GitHub/knowledge/` | Daily reducer decisions and audit trail |
+| Daily notes | `~/Obsidian Vault/Daily Notes/YYYY-MM-DD.md` | Output |
 | `com.michael.bee-proxy.plist` | `~/Library/LaunchAgents/` | Keeps bee proxy alive |
 | `com.michael.bee-to-obsidian.plist` | `~/Library/LaunchAgents/` | Schedules note writer |
 | `com.michael.bee-agent.plist` | `~/Library/LaunchAgents/` | Schedules accountability agent |
@@ -85,27 +85,27 @@ curl http://127.0.0.1:8787/v1/todos
 **Agent logged errors but nothing was processed:**
 ```bash
 # Delete state file to force re-processing from 24h ago
-rm ~/Documents/GitHub/knowledge/.bee_agent_state.json
+rm ~/GitHub/knowledge/.bee_agent_state.json
 # Manually trigger a run:
-python3 ~/Documents/GitHub/knowledge/bee_agent.py
+python3 ~/GitHub/knowledge/bee_agent.py
 ```
 
 **Daily note is stale:**
 ```bash
-python3 ~/Documents/GitHub/knowledge/bee_to_obsidian.py
+python3 ~/GitHub/knowledge/bee_to_obsidian.py
 
 **Review/apply staged candidates manually:**
 ```bash
-python3 ~/Documents/GitHub/knowledge/bee_daily_reducer.py --dry-run
-python3 ~/Documents/GitHub/knowledge/bee_daily_reducer.py
+python3 ~/GitHub/knowledge/bee_daily_reducer.py --dry-run
+python3 ~/GitHub/knowledge/bee_daily_reducer.py
 ```
 ```
 
 **Backfill historical notes:**
 ```bash
-python3 ~/Documents/GitHub/knowledge/bee_to_obsidian.py --backfill
+python3 ~/GitHub/knowledge/bee_to_obsidian.py --backfill
 # Use --force to overwrite existing notes
-python3 ~/Documents/GitHub/knowledge/bee_to_obsidian.py --backfill --force
+python3 ~/GitHub/knowledge/bee_to_obsidian.py --backfill --force
 ```
 
 **Reload all launchd agents after editing plists:**
