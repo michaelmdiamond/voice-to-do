@@ -263,8 +263,8 @@ def should_create_task(item: str | dict) -> tuple[bool, str]:
         return False, "low-commitment phrasing"
     if TRANSIENT_PATTERNS.search(task):
         return False, "transient/time-bound reminder"
-    if BABY_GUIDANCE_PATTERNS.search(task) and not COMMITMENT_PATTERNS.search(quote):
-        return False, "baby-care guidance without Michael commitment"
+    # Note: baby-care vs. concrete-chore disambiguation is handled in the LLM prompt now.
+    # The old quote-commitment gate auto-rejected summary-sourced items, so it was removed.
     return True, "accepted"
 
 
@@ -272,25 +272,31 @@ def should_create_task(item: str | dict) -> tuple[bool, str]:
 # LLM analysis via claude CLI
 # ---------------------------------------------------------------------------
 
-SYSTEM_PROMPT = """You are an accountability assistant analyzing transcripts from a wearable AI device worn by Michael.
+SYSTEM_PROMPT = """You are an accountability assistant analyzing a conversation captured by a wearable AI device worn by Michael.
 
-The transcript is the source of truth. The Bee summary is context only. Do not create or complete tasks
-from the summary unless the transcript also contains direct evidence.
+Bee's summary contains a curated "## Action Items" section. Treat that list as the PRIMARY source of
+candidate new tasks — it is a high-quality, pre-extracted list. Your job is to decide which of those
+items are durable, actionable tasks that MICHAEL should own and put on his to-do list. The raw transcript
+is noisy, un-diarized (every speaker shows as "Unknown"), and often mistranscribed — use it only as
+supporting context to confirm ownership or completion. The ABSENCE of a clean transcript quote is NOT a
+reason to reject a clear action item from the summary; quote the Bee action item or a summary line instead.
 
 Your main failure mode to avoid: merging adjacent but unrelated facts. If one person recommends a
 service, a different person is discussed elsewhere, and a price appears nearby, do NOT combine those
-facts unless the transcript explicitly says they are the same person/recommendation/rate.
+facts unless the source explicitly says they are the same person/recommendation/rate.
 
-COMPLETED tasks — mark done ONLY if the transcript contains direct evidence: past tense confirmation
-("I did X", "done", "finished"), someone confirming completion, or the action clearly happening now.
+COMPLETED tasks — mark done if the summary or transcript indicates the action was completed: past tense
+confirmation ("I did X", "done", "finished"), someone confirming completion, or the action clearly
+happening now.
 
-NEW tasks — capture ONLY durable commitments with direct transcript evidence. Keep the task text minimal.
-Do not include names, prices, dates, or relationships unless the evidence quote directly links them.
+NEW tasks — promote the Bee action items that are durable commitments Michael owns. Keep the task text
+minimal. Do not include names, prices, dates, or relationships unless the source directly links them.
 
 Reject:
+- action items that belong to someone other than Michael
 - vague ideas, brainstorming, jokes, or notes-to-self without commitment
-- generic baby-care guidance or transient reminders ("later today", "when a family member gets back")
-- inferred tasks based only on proximity of topics
+- generic baby-care guidance or transient reminders ("later today", "within 30 minutes", "when a family member gets back")
+- sports-betting/game-watching chatter ("check betting outcomes", "match starts at 1 PM")
 - tasks where the task text depends on unsupported details
 
 Respond ONLY with valid JSON in this exact format:
@@ -305,7 +311,7 @@ Respond ONLY with valid JSON in this exact format:
   "new_tasks": [
     {
       "task": "specific actionable task with unsupported details removed",
-      "evidence_quote": "short quote from transcript proving Michael's commitment",
+      "evidence_quote": "the Bee action item or summary/transcript line supporting this task",
       "confidence": "high|medium|low",
       "reject_if": "optional short reason this may be unsafe to create"
     }
@@ -316,9 +322,23 @@ Respond ONLY with valid JSON in this exact format:
 If nothing changed: {"completed": [], "new_tasks": [], "reasoning": "no high-confidence transcript-grounded changes detected"}"""
 
 
+ACTION_ITEMS_RE = re.compile(r"## Action Items\s*\n+\s*((?:[-*].+\n?)+)", re.IGNORECASE)
+
+
+def extract_action_items(summary: str) -> list[str]:
+    """Pull Bee's curated '## Action Items' bullet list out of a conversation summary."""
+    m = ACTION_ITEMS_RE.search(summary or "")
+    if not m:
+        return []
+    return [ln.strip(" -*\t").lstrip("[ ]").strip()
+            for ln in m.group(1).splitlines() if ln.strip(" -*\t")]
+
+
 def analyze_conversation(transcript: str, summary: str, open_tasks: list[dict]) -> dict:
     """Call claude CLI to analyze a conversation. Returns {completed, new_tasks, reasoning}."""
     task_list = "\n".join(f"- {t['content']}" for t in open_tasks) or "(no open tasks)"
+    action_items = extract_action_items(summary)
+    action_block = "\n".join(f"- {a}" for a in action_items) or "(none extracted)"
     claude_bin = shutil.which("claude") or next((p for p in CLAUDE_PATHS if Path(p).exists()), None)
     if not claude_bin:
         print("  [claude] executable not found", file=sys.stderr)
@@ -327,13 +347,16 @@ def analyze_conversation(transcript: str, summary: str, open_tasks: list[dict]) 
     user_message = f"""OPEN TASKS:
 {task_list}
 
+BEE ACTION ITEMS (primary candidate source — decide which are Michael's durable tasks):
+{action_block}
+
 CONVERSATION SUMMARY:
 {summary}
 
-FULL TRANSCRIPT:
+FULL TRANSCRIPT (noisy supporting context only):
 {transcript or "(no transcript available)"}
 
-Based on the above, which tasks were completed and what new tasks were mentioned?"""
+Based on the above, which open tasks were completed and which Bee action items should become Michael's new tasks?"""
 
     try:
         env = {
@@ -464,10 +487,19 @@ def main() -> None:
         ts      = conv["start_time"]
         short   = (conv.get("short_summary") or "").strip()
         summary = (conv.get("summary") or "").strip()
+        state   = (conv.get("state") or "").upper()
         dt      = datetime.fromtimestamp(ts / 1000, tz=tz)
 
         date_str = dt.strftime("%Y-%m-%d")
         print(f"\n  [{dt.strftime('%H:%M')}] {short[:60]}")
+
+        # Skip conversations Bee is still recording/processing. Do NOT mark them
+        # processed or advance the watermark, so they get picked up on a later run
+        # once their final summary (and Action Items) exists. Otherwise an in-progress
+        # ("CAPTURING") conversation would be consumed before its tasks are extractable.
+        if state in {"CAPTURING", "PROCESSING", "SUMMARIZING", "RECORDING"}:
+            print(f"    Skipping — still {state.lower()} (will retry next run)")
+            continue
 
         # Fetch full transcript
         try:
