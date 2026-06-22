@@ -11,6 +11,8 @@ Optional: TODOIST_API_TOKEN in .env for Todoist sync
 Optional: BEE_OBSIDIAN_PUSH_ACTIONS=1 to push Bee summary action items to Todoist
 Schedule: launchd plist at ~/Library/LaunchAgents/com.michael.bee-to-obsidian.plist
 """
+from __future__ import annotations  # PEP 604 (X | Y) hints work on the 3.9 system interpreter
+
 import json
 import os
 import re

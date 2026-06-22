@@ -10,6 +10,8 @@ Requires: bee proxy at http://127.0.0.1:8787, TODOIST_API_TOKEN in .env
 Uses: claude CLI (no API key needed — uses your Claude subscription)
 Schedule: ~/Library/LaunchAgents/com.michael.bee-agent.plist
 """
+from __future__ import annotations  # PEP 604 (X | Y) hints work on the 3.9 system interpreter
+
 import json
 import os
 import re

@@ -9,6 +9,8 @@ Todoist create list. This is the only default path that creates new Bee tasks.
 Requires: bee proxy at http://127.0.0.1:8787, TODOIST_API_TOKEN in .env
 Schedule: ~/Library/LaunchAgents/com.michael.bee-daily-reducer.plist
 """
+from __future__ import annotations  # PEP 604 (X | Y) hints work on the 3.9 system interpreter
+
 import argparse
 import hashlib
 import json
