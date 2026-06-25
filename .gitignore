@@ -12,6 +12,7 @@
 .bee_transcripts/
 .bee_candidates/
 .bee_decisions/
+.bee_labels/
 .bee_speech_profile/
 .bee_speech_flags/
 .bee_speech_pending.jsonl
