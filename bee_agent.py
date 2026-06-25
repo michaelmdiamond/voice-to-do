@@ -30,6 +30,14 @@ BEE_LABEL    = "bee"
 STATE_FILE   = Path(__file__).parent / ".bee_agent_state.json"
 CANDIDATE_DIR = Path(__file__).parent / ".bee_candidates"
 TRANSCRIPT_DIR = Path(__file__).parent / ".bee_transcripts"
+# Speech feedback loop: weekly profile writes the focus here, agent logs live hits.
+PROFILE_JSON_DIR = Path(__file__).parent / ".bee_speech_profile"
+FLAG_DIR = Path(__file__).parent / ".bee_speech_flags"
+# Task extraction runs every 30 min, but the speech-focus pass is throttled: each run
+# buffers its transcripts and one detection call fires only once the interval elapses.
+SPEECH_PENDING_FILE = Path(__file__).parent / ".bee_speech_pending.jsonl"
+SPEECH_STATE_FILE = Path(__file__).parent / ".bee_speech_state.json"
+SPEECH_DETECTION_INTERVAL_S = 2 * 3600  # at most one detection call every 2 hours
 CLAUDE_PATHS = [
     "/Users/michael/.local/bin/claude",
     "/Users/michael/.npm-global/bin/claude",
@@ -82,6 +90,67 @@ def save_transcript(date_str: str, record: dict) -> None:
     path = TRANSCRIPT_DIR / f"{date_str}.jsonl"
     with path.open("a") as f:
         f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+def week_label(dt: datetime) -> str:
+    iso = dt.isocalendar()
+    return f"{iso[0]}-W{iso[1]:02d}"
+
+
+def load_active_focus(now: datetime) -> dict | None:
+    """Read this week's speech-profile sidecar — the single pattern to watch for.
+    Returns None (loop silently inactive) until the weekly profiler has run."""
+    path = PROFILE_JSON_DIR / f"{week_label(now)}.json"
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text())
+    except (json.JSONDecodeError, OSError):
+        return None
+    return data if (data.get("week_focus") or "").strip() else None
+
+
+def append_speech_flag(date_str: str, flag: dict) -> None:
+    FLAG_DIR.mkdir(parents=True, exist_ok=True)
+    path = FLAG_DIR / f"{date_str}.jsonl"
+    with path.open("a") as f:
+        f.write(json.dumps(flag, ensure_ascii=False) + "\n")
+
+
+def buffer_speech_block(block: dict) -> None:
+    """Persist one analyzed conversation for the next throttled detection pass."""
+    with SPEECH_PENDING_FILE.open("a") as f:
+        f.write(json.dumps(block, ensure_ascii=False) + "\n")
+
+
+def load_speech_pending() -> list[dict]:
+    if not SPEECH_PENDING_FILE.exists():
+        return []
+    out = []
+    for line in SPEECH_PENDING_FILE.read_text().splitlines():
+        if line.strip():
+            try:
+                out.append(json.loads(line))
+            except json.JSONDecodeError:
+                pass
+    return out
+
+
+def clear_speech_pending() -> None:
+    SPEECH_PENDING_FILE.unlink(missing_ok=True)
+
+
+def speech_last_detection_ms() -> int:
+    if SPEECH_STATE_FILE.exists():
+        try:
+            return int(json.loads(SPEECH_STATE_FILE.read_text()).get("last_detection_ms", 0))
+        except (json.JSONDecodeError, ValueError, OSError):
+            return 0
+    return 0
+
+
+def set_speech_last_detection_ms(ms: int) -> None:
+    SPEECH_STATE_FILE.write_text(json.dumps({"last_detection_ms": ms}))
 
 
 # ---------------------------------------------------------------------------
@@ -405,6 +474,90 @@ Based on the above, which open tasks were completed and which Bee action items s
 
 
 # ---------------------------------------------------------------------------
+# Speech focus detection (real-time half of the speech feedback loop)
+# ---------------------------------------------------------------------------
+
+SPEECH_FOCUS_PROMPT = """You are watching for ONE specific speech pattern in conversations captured by Michael's wearable.
+
+You are given:
+- THE FOCUS: a single communication habit Michael decided to be more intentional about this week.
+- PATTERN CONTEXT: how that habit tends to show up.
+- NEW CONVERSATIONS: noisy, un-diarized transcripts (every speaker is "Unknown"; many words mistranscribed).
+
+Your only job: find concrete moments where MICHAEL exhibited the focus pattern. This is evidence-gated —
+every instance MUST include a direct quote from the transcript. If the audio is ambient media (TV, podcasts,
+broadcasts) or you cannot attribute a line to Michael with reasonable confidence, do not flag it. Returning
+nothing is correct and expected when the pattern did not clearly appear. Never invent instances.
+
+Respond ONLY with valid JSON:
+{
+  "focus_instances": [
+    {"quote": "exact transcript line showing the pattern", "note": "one phrase on why it matches", "confidence": "high|medium|low"}
+  ],
+  "summary": "one sentence on whether the pattern showed up this run"
+}
+
+If nothing clearly matched: {"focus_instances": [], "summary": "no clear instances"}"""
+
+
+def detect_speech_focus(corpus: str, focus: dict) -> dict:
+    """One claude call per run: scan this run's new conversations for the active focus pattern."""
+    claude_bin = shutil.which("claude") or next((p for p in CLAUDE_PATHS if Path(p).exists()), None)
+    if not claude_bin:
+        return {"focus_instances": [], "summary": "claude not found"}
+
+    patterns = focus.get("speech_patterns") or []
+    pattern_lines = "\n".join(
+        f"- {p.get('pattern', '')}: {p.get('observation', '')}" for p in patterns
+    ) or "(none provided)"
+    user_message = f"""THE FOCUS:
+{focus.get('week_focus', '')}
+
+PATTERN CONTEXT:
+{pattern_lines}
+
+NEW CONVERSATIONS:
+{corpus}
+
+Find concrete moments where Michael exhibited the focus pattern."""
+
+    try:
+        env = {
+            **os.environ,
+            "HOME": os.environ.get("HOME", "/Users/michael"),
+            "PATH": ":".join([
+                "/Users/michael/.local/bin",
+                "/Users/michael/.npm-global/bin",
+                "/opt/homebrew/bin",
+                "/usr/local/bin",
+                "/usr/bin",
+                "/bin",
+            ]),
+        }
+        result = subprocess.run(
+            [claude_bin, "-p", SPEECH_FOCUS_PROMPT],
+            input=user_message,
+            capture_output=True,
+            text=True,
+            timeout=120,
+            env=env,
+        )
+        output = result.stdout.strip()
+        if "hit your session limit" in output.lower():
+            return {"focus_instances": [], "summary": "session limit"}
+        m = re.search(r"\{.*\}", output, re.DOTALL)
+        if m:
+            return json.loads(m.group())
+    except subprocess.TimeoutExpired:
+        print("  [speech] detection timed out", file=sys.stderr)
+    except json.JSONDecodeError as e:
+        print(f"  [speech] invalid JSON: {e}", file=sys.stderr)
+    except Exception as e:  # noqa: BLE001 — the speech loop must never break task extraction
+        print(f"  [speech] detection failed: {e}", file=sys.stderr)
+    return {"focus_instances": [], "summary": "detection failed"}
+
+
+# ---------------------------------------------------------------------------
 # Notifications
 # ---------------------------------------------------------------------------
 
@@ -483,6 +636,7 @@ def main() -> None:
     completed_names: list[str] = []
     created_names: list[str]   = []
     latest_ms       = since_ms
+    focus = load_active_focus(now)  # speech-focus pattern for this week, if the profiler has run
 
     for conv in reversed(new_convs):  # process oldest first
         conv_id = conv["id"]
@@ -523,6 +677,10 @@ def main() -> None:
             "completed_tasks": [],
             "staged_tasks": [],
         }
+
+        # Buffer for the throttled speech-focus pass (only while a focus is active).
+        if focus and transcript:
+            buffer_speech_block({"time": dt.isoformat(), "short": short, "transcript": transcript})
 
         if not open_tasks and not summary:
             print("    Skipping — no tasks or summary")
@@ -626,14 +784,59 @@ def main() -> None:
         "processed_ids": list(processed_ids)[-500:],  # keep last 500 to bound size
     })
 
+    # ── Speech feedback loop ────────────────────────────────────────────────
+    # Throttled to one detection call every ~2h. Each run buffered its analyzed
+    # transcripts above; once the interval elapses we scan the whole buffer in a
+    # single call, log evidence-backed instances (with quotes), and reset. Next
+    # week's profiler grades the focus against these logs. Silently inactive until
+    # the first weekly profile sidecar exists.
+    speech_flagged = 0
+    if focus:
+        now_ms = int(now.timestamp() * 1000)
+        pending = load_speech_pending()
+        due = now_ms - speech_last_detection_ms() >= SPEECH_DETECTION_INTERVAL_S * 1000
+        if due and pending:
+            corpus_parts, total = [], 0
+            for b in pending:
+                block = f"--- [{b['time'][:16]}] {b['short']}\n{b['transcript'][:1500]}"
+                if total + len(block) > 40_000:
+                    break
+                corpus_parts.append(block)
+                total += len(block)
+            print(f"  [speech] 2h pass — scanning {len(corpus_parts)} buffered conversation(s)")
+            result = detect_speech_focus("\n\n".join(corpus_parts), focus)
+            date_str_now = now.strftime("%Y-%m-%d")
+            for inst in result.get("focus_instances", []):
+                quote = (inst.get("quote") or "").strip()
+                conf = (inst.get("confidence") or "").strip().lower()
+                if not quote or conf == "low":
+                    continue  # evidence-gated: require a real quote, drop low confidence
+                append_speech_flag(date_str_now, {
+                    "week": focus.get("week"),
+                    "focus": focus.get("week_focus"),
+                    "quote": quote,
+                    "note": (inst.get("note") or "").strip(),
+                    "confidence": conf,
+                    "logged_at": now.isoformat(),
+                })
+                speech_flagged += 1
+            clear_speech_pending()
+            set_speech_last_detection_ms(now_ms)
+            if speech_flagged:
+                print(f"  [speech] logged {speech_flagged} focus instance(s)")
+        elif pending:
+            print(f"  [speech] buffering {len(pending)} conv(s); 2h pass not yet due")
+
     # Notify if anything changed
-    if total_completed > 0 or total_new > 0:
+    if total_completed > 0 or total_new > 0 or speech_flagged > 0:
         parts = []
         if total_completed:
             parts.append(f"✅ {total_completed} done")
         if total_new:
             noun = "new" if create_immediately else "staged"
             parts.append(f"➕ {total_new} {noun}")
+        if speech_flagged:
+            parts.append(f"🗣 {speech_flagged} speech")
         notify("Bee Agent", " · ".join(parts))
 
         # Phone push with the actual task text (no-op unless Telegram is configured)
@@ -645,6 +848,9 @@ def main() -> None:
         if completed_names:
             tg_lines.append("\n✅ *Completed:*")
             tg_lines += [f"• {n}" for n in completed_names]
+        if speech_flagged and focus:
+            tg_lines.append(f"\n🗣 *Speech focus* — {speech_flagged}× this run")
+            tg_lines.append(f"_{(focus.get('week_focus') or '')[:140]}_")
         send_telegram("\n".join(tg_lines))
 
         print(f"\n  Notified: {' · '.join(parts)}")

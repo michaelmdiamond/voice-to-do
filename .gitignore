@@ -12,6 +12,10 @@
 .bee_transcripts/
 .bee_candidates/
 .bee_decisions/
+.bee_speech_profile/
+.bee_speech_flags/
+.bee_speech_pending.jsonl
+.bee_speech_state.json
 
 # Pipeline runtime state
 .bee_agent_state.json
