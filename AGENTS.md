@@ -54,3 +54,6 @@ Bee wearable → Bee cloud API → local proxy (127.0.0.1:8787)
 
 ## Output targets
 - **Todoist** (task sync) and **Obsidian** (daily note) — both configured via `.env`.
+
+## Planning Rule
+- Every time you create or modify an implementation plan (`implementation_plan.md`), you MUST provide a concise message in the chat explaining the key details, proposed changes, and decisions of the plan to the user, overriding any instructions to only point them to the artifact.
