@@ -41,6 +41,11 @@ CLAUDE_PATHS = [
     "/opt/homebrew/bin/claude",
     "/usr/local/bin/claude",
 ]
+AGY_PATHS = [
+    "/Users/michael/.local/bin/agy",
+    "/opt/homebrew/bin/agy",
+    "/usr/local/bin/agy",
+]
 
 
 def load_env(key: str) -> str | None:
@@ -285,10 +290,113 @@ Respond ONLY with valid JSON:
 If nothing should be created, return {"approved": [], "rejected": [], "summary": "no durable tasks approved"}."""
 
 
-def call_claude(payload: dict) -> dict:
-    claude_bin = shutil.which("claude") or next((p for p in CLAUDE_PATHS if Path(p).exists()), None)
-    if not claude_bin:
-        raise RuntimeError("claude executable not found")
+def get_env_dict() -> dict[str, str]:
+    """Load the entire .env file as a dictionary."""
+    env_dict = {}
+    env_path = Path(__file__).parent / ".env"
+    if env_path.exists():
+        for line in env_path.read_text().splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if "=" in line:
+                key, val = line.split("=", 1)
+                env_dict[key.strip()] = val.strip()
+    return env_dict
+
+
+def call_llm(payload: dict, force_provider: str | None = None) -> dict:
+    provider = force_provider or (load_env("BEE_LLM_MODE") or "claude").lower()
+    if provider == "consensus":
+        provider = "claude"
+
+    env = {
+        **os.environ,
+        **get_env_dict(),
+        "HOME": os.environ.get("HOME", "/Users/michael"),
+        "PATH": ":".join([
+            "/Users/michael/.local/bin",
+            "/Users/michael/.npm-global/bin",
+            "/opt/homebrew/bin",
+            "/usr/local/bin",
+            "/usr/bin",
+            "/bin",
+        ]),
+    }
+
+    user_message = json.dumps(payload, indent=2, ensure_ascii=False)
+
+    if provider in ("gemini", "agy"):
+        bin_path = shutil.which("agy") or next((p for p in AGY_PATHS if Path(p).exists()), None)
+        if not bin_path:
+            raise RuntimeError("Gemini/Agy executable not found")
+        combined_prompt = f"{SYSTEM_PROMPT}\n\nINPUT DATA:\n{user_message}"
+        result = subprocess.run(
+            [bin_path, "--dangerously-skip-permissions", "-p", combined_prompt],
+            capture_output=True,
+            text=True,
+            timeout=180,
+            env=env,
+        )
+        output = result.stdout.strip()
+        if result.returncode != 0:
+            err_msg = result.stderr.strip() or f"exit code {result.returncode}"
+            raise RuntimeError(f"agy CLI error: {err_msg}")
+    else:
+        bin_path = shutil.which("claude") or next((p for p in CLAUDE_PATHS if Path(p).exists()), None)
+        if not bin_path:
+            raise RuntimeError("Claude executable not found")
+        result = subprocess.run(
+            [bin_path, "-p", SYSTEM_PROMPT],
+            input=user_message,
+            capture_output=True,
+            text=True,
+            timeout=180,
+            env=env,
+        )
+        output = result.stdout.strip()
+        if "hit your session limit" in output.lower():
+            raise RuntimeError("claude session limit hit; retry later")
+        if result.returncode != 0:
+            err_msg = result.stderr.strip() or f"exit code {result.returncode}"
+            raise RuntimeError(f"claude CLI error: {err_msg}")
+
+    match = re.search(r"\{.*\}", output, re.DOTALL)
+    if not match:
+        raise RuntimeError(f"Model returned no JSON: {output[:200]}")
+    return json.loads(match.group())
+
+
+def reconcile_reduction(payload: dict, res_c: dict, res_g: dict) -> dict:
+    """Run a reconciliation pass using Gemini/Agy (falling back to Claude) to resolve reducer disagreements."""
+    reconcile_prompt = """You are arbitrating between two AI decisions for a daily task candidate reduction pipeline.
+
+We have a set of open tasks and candidate tasks.
+Our goal is to output a final list of approved and rejected tasks.
+
+DECISION A (Claude):
+%s
+
+DECISION B (Gemini):
+%s
+
+Your job:
+1. Examine the candidates, open tasks, and both decisions.
+2. Resolve any differences.
+3. Be highly conservative: approve a task ONLY if it has a direct quote, high confidence, and is not a duplicate.
+4. Output a single, finalized JSON resolving all contradictions.
+
+Respond ONLY with valid JSON in the format:
+{
+  "approved": [
+     {"task": "content", "evidence_quote": "...", "confidence": "high", "reason": "why durable"}
+  ],
+  "rejected": [
+     {"task": "content", "reason": "why rejected"}
+  ],
+  "summary": "Brief explanation of how you resolved discrepancies."
+}""" % (json.dumps(res_c, indent=2), json.dumps(res_g, indent=2))
+
     env = {
         **os.environ,
         "HOME": os.environ.get("HOME", "/Users/michael"),
@@ -301,21 +409,90 @@ def call_claude(payload: dict) -> dict:
             "/bin",
         ]),
     }
-    result = subprocess.run(
-        [claude_bin, "-p", SYSTEM_PROMPT],
-        input=json.dumps(payload, indent=2, ensure_ascii=False),
-        capture_output=True,
-        text=True,
-        timeout=180,
-        env=env,
-    )
-    output = result.stdout.strip()
-    if "hit your session limit" in output.lower():
-        raise RuntimeError("claude session limit hit; retry later")
-    match = re.search(r"\{.*\}", output, re.DOTALL)
-    if not match:
-        raise RuntimeError(f"claude returned no JSON: {output[:200]}")
-    return json.loads(match.group())
+    
+    user_message = f"INPUT CANDIDATES & CONTEXT:\n{json.dumps(payload, indent=2, ensure_ascii=False)}"
+
+    # Run on Gemini to save Claude credits, fallback to Claude
+    for provider in ("gemini", "claude"):
+        try:
+            if provider in ("gemini", "agy"):
+                bin_path = shutil.which("agy") or next((p for p in AGY_PATHS if Path(p).exists()), None)
+                if not bin_path:
+                    continue
+                combined_prompt = f"{reconcile_prompt}\n\n{user_message}"
+                result = subprocess.run(
+                    [bin_path, "--dangerously-skip-permissions", "-p", combined_prompt],
+                    capture_output=True,
+                    text=True,
+                    timeout=180,
+                    env=env,
+                )
+                output = result.stdout.strip()
+            else:
+                bin_path = shutil.which("claude") or next((p for p in CLAUDE_PATHS if Path(p).exists()), None)
+                if not bin_path:
+                    continue
+                result = subprocess.run(
+                    [bin_path, "-p", reconcile_prompt],
+                    input=user_message,
+                    capture_output=True,
+                    text=True,
+                    timeout=180,
+                    env=env,
+                )
+                output = result.stdout.strip()
+
+            m = re.search(r"\{.*\}", output, re.DOTALL)
+            if m:
+                return json.loads(m.group())
+        except Exception as e:
+            print(f"  [reconciliation] reducer failed with {provider}: {e}", file=sys.stderr)
+            continue
+
+    print("  [reconciliation] all providers failed, falling back to Claude decisions", file=sys.stderr)
+    return res_c
+
+
+def call_claude(payload: dict) -> dict:
+    mode = (load_env("BEE_LLM_MODE") or "claude").lower()
+    if mode == "consensus":
+        print("  [reducer] Running consensus mode (Claude + Gemini)...", file=sys.stderr)
+        res_c, res_g = {}, {}
+        
+        # 1. Run Claude
+        try:
+            res_c = call_llm(payload, force_provider="claude")
+        except Exception as e:
+            print(f"  [reducer] Claude run failed: {e}", file=sys.stderr)
+            
+        # 2. Run Gemini
+        try:
+            res_g = call_llm(payload, force_provider="gemini")
+        except Exception as e:
+            print(f"  [reducer] Gemini run failed: {e}", file=sys.stderr)
+
+        if not res_c and not res_g:
+            raise RuntimeError("Both models failed during daily reduction")
+        if not res_c:
+            print("  [reducer] Claude failed, using Gemini decisions", file=sys.stderr)
+            return res_g
+        if not res_g:
+            print("  [reducer] Gemini failed, using Claude decisions", file=sys.stderr)
+            return res_c
+
+        # Compare approved lists
+        c_app = sorted([t.get("task", "").lower().strip() for t in res_c.get("approved", [])])
+        g_app = sorted([t.get("task", "").lower().strip() for t in res_g.get("approved", [])])
+
+        if c_app == g_app:
+            print("  [reducer] Claude and Gemini agree on approved tasks.", file=sys.stderr)
+            return res_c
+            
+        print("  [reducer] Disagreement on approvals. Running reconciliation pass...", file=sys.stderr)
+        return reconcile_reduction(payload, res_c, res_g)
+    else:
+        provider = "gemini" if mode in ("gemini", "agy") else "claude"
+        return call_llm(payload, force_provider=provider)
 
 
 def should_apply_approved(item: dict, open_keys: set[str]) -> tuple[bool, str]:

@@ -44,6 +44,11 @@ CLAUDE_PATHS = [
     "/opt/homebrew/bin/claude",
     "/usr/local/bin/claude",
 ]
+AGY_PATHS = [
+    "/Users/michael/.local/bin/agy",
+    "/opt/homebrew/bin/agy",
+    "/usr/local/bin/agy",
+]
 
 
 # ---------------------------------------------------------------------------
@@ -405,16 +410,135 @@ def extract_action_items(summary: str) -> list[str]:
             for ln in m.group(1).splitlines() if ln.strip(" -*\t")]
 
 
+def get_env_dict() -> dict[str, str]:
+    """Load the entire .env file as a dictionary."""
+    env_dict = {}
+    env_path = Path(__file__).parent / ".env"
+    if env_path.exists():
+        for line in env_path.read_text().splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if "=" in line:
+                key, val = line.split("=", 1)
+                env_dict[key.strip()] = val.strip()
+    return env_dict
+
+
+def call_llm(system_prompt: str, user_message: str, timeout_s: int = 90, force_provider: str | None = None) -> str:
+    """Shell out to the chosen LLM backend (Claude or Gemini/Agy) non-interactively."""
+    provider = force_provider or (load_env("BEE_LLM_MODE") or "claude").lower()
+    if provider == "consensus":
+        provider = "claude"
+
+    env = {
+        **os.environ,
+        **get_env_dict(),
+        "HOME": os.environ.get("HOME", "/Users/michael"),
+        "PATH": ":".join([
+            "/Users/michael/.local/bin",
+            "/Users/michael/.npm-global/bin",
+            "/opt/homebrew/bin",
+            "/usr/local/bin",
+            "/usr/bin",
+            "/bin",
+        ]),
+    }
+
+    if provider in ("gemini", "agy"):
+        bin_path = shutil.which("agy") or next((p for p in AGY_PATHS if Path(p).exists()), None)
+        if not bin_path:
+            raise RuntimeError("Gemini/Agy executable not found")
+        combined_prompt = f"{system_prompt}\n\n{user_message}"
+        result = subprocess.run(
+            [bin_path, "--dangerously-skip-permissions", "-p", combined_prompt],
+            capture_output=True,
+            text=True,
+            timeout=timeout_s,
+            env=env,
+        )
+        if result.returncode != 0:
+            err_msg = result.stderr.strip() or f"exit code {result.returncode}"
+            raise RuntimeError(f"agy CLI error: {err_msg}")
+        return result.stdout.strip()
+    else:
+        # Default to Claude
+        bin_path = shutil.which("claude") or next((p for p in CLAUDE_PATHS if Path(p).exists()), None)
+        if not bin_path:
+            raise RuntimeError("Claude executable not found")
+        result = subprocess.run(
+            [bin_path, "-p", system_prompt],
+            input=user_message,
+            capture_output=True,
+            text=True,
+            timeout=timeout_s,
+            env=env,
+        )
+        output = result.stdout.strip()
+        if "hit your session limit" in output.lower():
+            raise RuntimeError("claude session limit hit")
+        if result.returncode != 0:
+            err_msg = result.stderr.strip() or f"exit code {result.returncode}"
+            raise RuntimeError(f"claude CLI error: {err_msg}")
+        return output
+
+
+def reconcile_analyses(transcript: str, open_tasks: list[dict], res_c: dict, res_g: dict) -> dict:
+    """Run a reconciliation pass using Gemini/Agy (falling back to Claude) when Claude and Gemini differ."""
+    task_list = "\n".join(f"- {t['content']}" for t in open_tasks) or "(no open tasks)"
+    reconcile_prompt = """You are arbitrating between two AI analyses of a conversation transcript for an automated task manager.
+
+ANALYSIS A (Claude):
+%s
+
+ANALYSIS B (Gemini):
+%s
+
+Your job:
+1. Examine the open tasks, the transcript, and both analyses.
+2. Resolve any differences.
+3. Be highly conservative: only check off tasks if there is clear evidence, and only extract new tasks if they are durable, high-confidence commitments with direct quotes.
+4. Output a single, finalized JSON resolving all contradictions.
+
+Respond ONLY with valid JSON in the format:
+{
+  "completed": ["task content"],
+  "new_tasks": [
+     {"task": "content", "evidence_quote": "...", "confidence": "high|medium|low"}
+  ],
+  "reasoning": "Brief explanation of how you resolved discrepancies."
+}""" % (json.dumps(res_c, indent=2), json.dumps(res_g, indent=2))
+
+    user_message = f"""OPEN TASKS:
+{task_list}
+
+TRANSCRIPT:
+{transcript or "(no transcript available)"}
+
+Determine the final consolidated list of completed and new tasks."""
+
+    # Reconciliation runs on Gemini to save Claude credits, falling back to Claude if needed.
+    for provider in ("gemini", "claude"):
+        try:
+            output = call_llm(reconcile_prompt, user_message, force_provider=provider)
+            m = re.search(r"\{.*\}", output, re.DOTALL)
+            if m:
+                return json.loads(m.group())
+        except Exception as e:
+            print(f"  [reconciliation] failed with {provider}: {e}", file=sys.stderr)
+            continue
+    
+    print("  [reconciliation] all providers failed, falling back to Claude analysis", file=sys.stderr)
+    return res_c
+
+
 def analyze_conversation(transcript: str, summary: str, open_tasks: list[dict]) -> dict:
-    """Call claude CLI to analyze a conversation. Returns {completed, new_tasks, reasoning}."""
+    """Analyze a conversation using the configured LLM mode (Claude, Gemini, or Consensus)."""
+    mode = (load_env("BEE_LLM_MODE") or "claude").lower()
     task_list = "\n".join(f"- {t['content']}" for t in open_tasks) or "(no open tasks)"
     action_items = extract_action_items(summary)
     action_block = "\n".join(f"- {a}" for a in action_items) or "(none extracted)"
-    claude_bin = shutil.which("claude") or next((p for p in CLAUDE_PATHS if Path(p).exists()), None)
-    if not claude_bin:
-        print("  [claude] executable not found", file=sys.stderr)
-        return {"completed": [], "new_tasks": [], "reasoning": "analysis failed"}
-
+    
     user_message = f"""OPEN TASKS:
 {task_list}
 
@@ -429,48 +553,61 @@ FULL TRANSCRIPT (noisy supporting context only):
 
 Based on the above, which open tasks were completed and which Bee action items should become Michael's new tasks?"""
 
-    try:
-        env = {
-            **os.environ,
-            "HOME": os.environ.get("HOME", "/Users/michael"),
-            "PATH": ":".join([
-                "/Users/michael/.local/bin",
-                "/Users/michael/.npm-global/bin",
-                "/opt/homebrew/bin",
-                "/usr/local/bin",
-                "/usr/bin",
-                "/bin",
-            ]),
-        }
-        result = subprocess.run(
-            [claude_bin, "-p", SYSTEM_PROMPT],  # uses subscription default model
-            input=user_message,
-            capture_output=True,
-            text=True,
-            timeout=90,
-            env=env,
-        )
-        output = result.stdout.strip()
-        if "hit your session limit" in output.lower():
-            return {
-                "completed": [],
-                "new_tasks": [],
-                "reasoning": "claude session limit hit; retry later",
-                "retry_later": True,
-            }
-        # Extract JSON even if wrapped in markdown code fences
-        json_match = re.search(r'\{.*\}', output, re.DOTALL)
-        if json_match:
-            return json.loads(json_match.group())
-        print(f"  [claude] no JSON in output: {output[:100]}", file=sys.stderr)
-    except subprocess.TimeoutExpired:
-        print("  [claude] timed out after 90s", file=sys.stderr)
-    except json.JSONDecodeError as e:
-        print(f"  [claude] invalid JSON: {e}", file=sys.stderr)
-    except Exception as e:
-        print(f"  [claude] error: {e}", file=sys.stderr)
+    if mode == "consensus":
+        print("  [llm] Running consensus mode (Claude + Gemini)...", file=sys.stderr)
+        res_c, res_g = {}, {}
+        
+        # 1. Run Claude
+        try:
+            output_c = call_llm(SYSTEM_PROMPT, user_message, force_provider="claude")
+            m = re.search(r"\{.*\}", output_c, re.DOTALL)
+            res_c = json.loads(m.group()) if m else {}
+        except Exception as e:
+            print(f"  [llm] Claude run failed: {e}", file=sys.stderr)
+            
+        # 2. Run Gemini
+        try:
+            output_g = call_llm(SYSTEM_PROMPT, user_message, force_provider="gemini")
+            m = re.search(r"\{.*\}", output_g, re.DOTALL)
+            res_g = json.loads(m.group()) if m else {}
+        except Exception as e:
+            print(f"  [llm] Gemini run failed: {e}", file=sys.stderr)
 
-    return {"completed": [], "new_tasks": [], "reasoning": "analysis failed", "retry_later": True}
+        if not res_c and not res_g:
+            return {"completed": [], "new_tasks": [], "reasoning": "both models failed", "retry_later": True}
+        if not res_c:
+            print("  [llm] Claude failed, using Gemini output directly", file=sys.stderr)
+            return res_g
+        if not res_g:
+            print("  [llm] Gemini failed, using Claude output directly", file=sys.stderr)
+            return res_c
+
+        c_comp = sorted(k for t in res_c.get("completed", []) if (k := coerce_text_item(t).lower()))
+        g_comp = sorted(k for t in res_g.get("completed", []) if (k := coerce_text_item(t).lower()))
+        c_new = sorted(k for t in res_c.get("new_tasks", []) if (k := coerce_text_item(t).lower()))
+        g_new = sorted(k for t in res_g.get("new_tasks", []) if (k := coerce_text_item(t).lower()))
+
+        if c_comp == g_comp and c_new == g_new:
+            print("  [llm] Claude and Gemini agree perfectly.", file=sys.stderr)
+            return res_c
+        
+        print("  [llm] Disagreement detected. Running reconciliation pass...", file=sys.stderr)
+        return reconcile_analyses(transcript, open_tasks, res_c, res_g)
+
+    else:
+        provider = "gemini" if mode in ("gemini", "agy") else "claude"
+        try:
+            output = call_llm(SYSTEM_PROMPT, user_message, force_provider=provider)
+            m = re.search(r"\{.*\}", output, re.DOTALL)
+            if m:
+                return json.loads(m.group())
+            print(f"  [{provider}] no JSON in output: {output[:100]}", file=sys.stderr)
+        except Exception as e:
+            print(f"  [{provider}] error during analysis: {e}", file=sys.stderr)
+            if "session limit" in str(e):
+                return {"completed": [], "new_tasks": [], "reasoning": f"{provider} session limit hit", "retry_later": True}
+            
+        return {"completed": [], "new_tasks": [], "reasoning": "analysis failed", "retry_later": True}
 
 
 # ---------------------------------------------------------------------------
@@ -501,11 +638,8 @@ If nothing clearly matched: {"focus_instances": [], "summary": "no clear instanc
 
 
 def detect_speech_focus(corpus: str, focus: dict) -> dict:
-    """One claude call per run: scan this run's new conversations for the active focus pattern."""
-    claude_bin = shutil.which("claude") or next((p for p in CLAUDE_PATHS if Path(p).exists()), None)
-    if not claude_bin:
-        return {"focus_instances": [], "summary": "claude not found"}
-
+    """One LLM call per run: scan this run's new conversations for the active focus pattern."""
+    mode = (load_env("BEE_LLM_MODE") or "claude").lower()
     patterns = focus.get("speech_patterns") or []
     pattern_lines = "\n".join(
         f"- {p.get('pattern', '')}: {p.get('observation', '')}" for p in patterns
@@ -521,38 +655,15 @@ NEW CONVERSATIONS:
 
 Find concrete moments where Michael exhibited the focus pattern."""
 
+    # Soft flag: run Gemini for consensus/gemini modes, Claude for claude mode
+    provider = "gemini" if mode in ("consensus", "gemini", "agy") else "claude"
+    
     try:
-        env = {
-            **os.environ,
-            "HOME": os.environ.get("HOME", "/Users/michael"),
-            "PATH": ":".join([
-                "/Users/michael/.local/bin",
-                "/Users/michael/.npm-global/bin",
-                "/opt/homebrew/bin",
-                "/usr/local/bin",
-                "/usr/bin",
-                "/bin",
-            ]),
-        }
-        result = subprocess.run(
-            [claude_bin, "-p", SPEECH_FOCUS_PROMPT],
-            input=user_message,
-            capture_output=True,
-            text=True,
-            timeout=120,
-            env=env,
-        )
-        output = result.stdout.strip()
-        if "hit your session limit" in output.lower():
-            return {"focus_instances": [], "summary": "session limit"}
+        output = call_llm(SPEECH_FOCUS_PROMPT, user_message, force_provider=provider)
         m = re.search(r"\{.*\}", output, re.DOTALL)
         if m:
             return json.loads(m.group())
-    except subprocess.TimeoutExpired:
-        print("  [speech] detection timed out", file=sys.stderr)
-    except json.JSONDecodeError as e:
-        print(f"  [speech] invalid JSON: {e}", file=sys.stderr)
-    except Exception as e:  # noqa: BLE001 — the speech loop must never break task extraction
+    except Exception as e:
         print(f"  [speech] detection failed: {e}", file=sys.stderr)
     return {"focus_instances": [], "summary": "detection failed"}
 

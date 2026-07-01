@@ -36,6 +36,11 @@ CLAUDE_PATHS = [
     "/opt/homebrew/bin/claude",
     "/usr/local/bin/claude",
 ]
+AGY_PATHS = [
+    "/Users/michael/.local/bin/agy",
+    "/opt/homebrew/bin/agy",
+    "/usr/local/bin/agy",
+]
 DEFAULT_DAYS = 7
 MAX_TRANSCRIPT_CHARS = 1200  # per conversation — raw transcripts are noisy
 MAX_TOTAL_CHARS = 80_000     # trim oldest conversations if exceeded
@@ -198,11 +203,25 @@ def summarize_flags(flags: list[dict]) -> str:
     return "\n".join(lines)
 
 
+def get_env_dict() -> dict[str, str]:
+    """Load the entire .env file as a dictionary."""
+    env_dict = {}
+    env_path = Path(__file__).parent / ".env"
+    if env_path.exists():
+        for line in env_path.read_text().splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if "=" in line:
+                key, val = line.split("=", 1)
+                env_dict[key.strip()] = val.strip()
+    return env_dict
+
+
 def call_claude(corpus: str, days: int, prev_profile: str | None,
                 logged_flags: list[dict] | None = None) -> dict:
-    claude_bin = shutil.which("claude") or next((p for p in CLAUDE_PATHS if Path(p).exists()), None)
-    if not claude_bin:
-        raise RuntimeError("claude executable not found")
+    mode = (load_env("BEE_LLM_MODE") or "claude").lower()
+    provider = "gemini" if mode in ("gemini", "consensus", "agy") else "claude"
 
     parts = [f"Analyze speech patterns across {days} days of conversations:\n\n{corpus}"]
     if prev_profile:
@@ -214,6 +233,7 @@ def call_claude(corpus: str, days: int, prev_profile: str | None,
 
     env = {
         **os.environ,
+        **get_env_dict(),
         "HOME": os.environ.get("HOME", "/Users/michael"),
         "PATH": ":".join([
             "/Users/michael/.local/bin",
@@ -224,20 +244,45 @@ def call_claude(corpus: str, days: int, prev_profile: str | None,
             "/bin",
         ]),
     }
-    result = subprocess.run(
-        [claude_bin, "-p", SYSTEM_PROMPT],
-        input=user_message,
-        capture_output=True,
-        text=True,
-        timeout=300,  # full-week 80k-char analysis can run long; weekly job, so fine
-        env=env,
-    )
-    output = result.stdout.strip()
-    if "hit your session limit" in output.lower():
-        raise RuntimeError("claude session limit hit; retry later")
+
+    if provider in ("gemini", "agy"):
+        bin_path = shutil.which("agy") or next((p for p in AGY_PATHS if Path(p).exists()), None)
+        if not bin_path:
+            raise RuntimeError("Gemini/Agy executable not found")
+        combined_prompt = f"{SYSTEM_PROMPT}\n\n{user_message}"
+        result = subprocess.run(
+            [bin_path, "--dangerously-skip-permissions", "-p", combined_prompt],
+            capture_output=True,
+            text=True,
+            timeout=300,
+            env=env,
+        )
+        output = result.stdout.strip()
+        if result.returncode != 0:
+            err_msg = result.stderr.strip() or f"exit code {result.returncode}"
+            raise RuntimeError(f"agy CLI error: {err_msg}")
+    else:
+        bin_path = shutil.which("claude") or next((p for p in CLAUDE_PATHS if Path(p).exists()), None)
+        if not bin_path:
+            raise RuntimeError("Claude executable not found")
+        result = subprocess.run(
+            [bin_path, "-p", SYSTEM_PROMPT],
+            input=user_message,
+            capture_output=True,
+            text=True,
+            timeout=300,
+            env=env,
+        )
+        output = result.stdout.strip()
+        if "hit your session limit" in output.lower():
+            raise RuntimeError("claude session limit hit; retry later")
+        if result.returncode != 0:
+            err_msg = result.stderr.strip() or f"exit code {result.returncode}"
+            raise RuntimeError(f"claude CLI error: {err_msg}")
+
     match = re.search(r"\{.*\}", output, re.DOTALL)
     if not match:
-        raise RuntimeError(f"no JSON in claude output: {output[:200]}")
+        raise RuntimeError(f"Model returned no JSON: {output[:200]}")
     return json.loads(match.group())
 
 
