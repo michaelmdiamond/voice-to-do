@@ -10,7 +10,9 @@ Requires: bee proxy at http://127.0.0.1:8787, TODOIST_API_TOKEN in .env
 Uses: claude CLI (no API key needed — uses your Claude subscription)
 Schedule: ~/Library/LaunchAgents/com.michael.bee-agent.plist
 """
-from __future__ import annotations  # PEP 604 (X | Y) hints work on the 3.9 system interpreter
+from __future__ import annotations
+
+from bee_inference import infer  # PEP 604 (X | Y) hints work on the 3.9 system interpreter
 
 import json
 import os
@@ -426,61 +428,9 @@ def get_env_dict() -> dict[str, str]:
 
 
 def call_llm(system_prompt: str, user_message: str, timeout_s: int = 90, force_provider: str | None = None) -> str:
-    """Shell out to the chosen LLM backend (Claude or Gemini/Agy) non-interactively."""
-    provider = force_provider or (load_env("BEE_LLM_MODE") or "claude").lower()
-    if provider == "consensus":
-        provider = "claude"
+    """Use subscription Claude with tools, MCP, hooks and skills disabled."""
+    return infer(system_prompt, user_message, timeout_s)
 
-    env = {
-        **os.environ,
-        **get_env_dict(),
-        "HOME": os.environ.get("HOME", "/Users/michael"),
-        "PATH": ":".join([
-            "/Users/michael/.local/bin",
-            "/Users/michael/.npm-global/bin",
-            "/opt/homebrew/bin",
-            "/usr/local/bin",
-            "/usr/bin",
-            "/bin",
-        ]),
-    }
-
-    if provider in ("gemini", "agy"):
-        bin_path = shutil.which("agy") or next((p for p in AGY_PATHS if Path(p).exists()), None)
-        if not bin_path:
-            raise RuntimeError("Gemini/Agy executable not found")
-        combined_prompt = f"{system_prompt}\n\n{user_message}"
-        result = subprocess.run(
-            [bin_path, "--dangerously-skip-permissions", "-p", combined_prompt],
-            capture_output=True,
-            text=True,
-            timeout=timeout_s,
-            env=env,
-        )
-        if result.returncode != 0:
-            err_msg = result.stderr.strip() or f"exit code {result.returncode}"
-            raise RuntimeError(f"agy CLI error: {err_msg}")
-        return result.stdout.strip()
-    else:
-        # Default to Claude
-        bin_path = shutil.which("claude") or next((p for p in CLAUDE_PATHS if Path(p).exists()), None)
-        if not bin_path:
-            raise RuntimeError("Claude executable not found")
-        result = subprocess.run(
-            [bin_path, "-p", system_prompt],
-            input=user_message,
-            capture_output=True,
-            text=True,
-            timeout=timeout_s,
-            env=env,
-        )
-        output = result.stdout.strip()
-        if "hit your session limit" in output.lower():
-            raise RuntimeError("claude session limit hit")
-        if result.returncode != 0:
-            err_msg = result.stderr.strip() or f"exit code {result.returncode}"
-            raise RuntimeError(f"claude CLI error: {err_msg}")
-        return output
 
 
 def reconcile_analyses(transcript: str, open_tasks: list[dict], res_c: dict, res_g: dict) -> dict:
@@ -534,7 +484,7 @@ Determine the final consolidated list of completed and new tasks."""
 
 def analyze_conversation(transcript: str, summary: str, open_tasks: list[dict]) -> dict:
     """Analyze a conversation using the configured LLM mode (Claude, Gemini, or Consensus)."""
-    mode = (load_env("BEE_LLM_MODE") or "claude").lower()
+    mode = "claude"  # Tool-free subscription inference; agy has no equivalent tool-off mode.
     task_list = "\n".join(f"- {t['content']}" for t in open_tasks) or "(no open tasks)"
     action_items = extract_action_items(summary)
     action_block = "\n".join(f"- {a}" for a in action_items) or "(none extracted)"
@@ -639,7 +589,7 @@ If nothing clearly matched: {"focus_instances": [], "summary": "no clear instanc
 
 def detect_speech_focus(corpus: str, focus: dict) -> dict:
     """One LLM call per run: scan this run's new conversations for the active focus pattern."""
-    mode = (load_env("BEE_LLM_MODE") or "claude").lower()
+    mode = "claude"  # Tool-free subscription inference; agy has no equivalent tool-off mode.
     patterns = focus.get("speech_patterns") or []
     pattern_lines = "\n".join(
         f"- {p.get('pattern', '')}: {p.get('observation', '')}" for p in patterns
