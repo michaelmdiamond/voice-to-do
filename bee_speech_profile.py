@@ -11,6 +11,8 @@ Schedule: ~/Library/LaunchAgents/com.michael.bee-speech-profile.plist (weekly)
 """
 from __future__ import annotations
 
+from bee_inference import infer
+
 import argparse
 import json
 import os
@@ -220,7 +222,7 @@ def get_env_dict() -> dict[str, str]:
 
 def call_claude(corpus: str, days: int, prev_profile: str | None,
                 logged_flags: list[dict] | None = None) -> dict:
-    mode = (load_env("BEE_LLM_MODE") or "claude").lower()
+    mode = "claude"  # Tool-free subscription inference; agy has no equivalent tool-off mode.
     provider = "gemini" if mode in ("gemini", "consensus", "agy") else "claude"
 
     parts = [f"Analyze speech patterns across {days} days of conversations:\n\n{corpus}"]
@@ -231,59 +233,13 @@ def call_claude(corpus: str, days: int, prev_profile: str | None,
         parts.append(f"\nLOGGED FOCUS INSTANCES (live captures of last week's focus pattern):\n{flag_block}")
     user_message = "\n".join(parts)
 
-    env = {
-        **os.environ,
-        **get_env_dict(),
-        "HOME": os.environ.get("HOME", "/Users/michael"),
-        "PATH": ":".join([
-            "/Users/michael/.local/bin",
-            "/Users/michael/.npm-global/bin",
-            "/opt/homebrew/bin",
-            "/usr/local/bin",
-            "/usr/bin",
-            "/bin",
-        ]),
-    }
-
-    if provider in ("gemini", "agy"):
-        bin_path = shutil.which("agy") or next((p for p in AGY_PATHS if Path(p).exists()), None)
-        if not bin_path:
-            raise RuntimeError("Gemini/Agy executable not found")
-        combined_prompt = f"{SYSTEM_PROMPT}\n\n{user_message}"
-        result = subprocess.run(
-            [bin_path, "--dangerously-skip-permissions", "-p", combined_prompt],
-            capture_output=True,
-            text=True,
-            timeout=300,
-            env=env,
-        )
-        output = result.stdout.strip()
-        if result.returncode != 0:
-            err_msg = result.stderr.strip() or f"exit code {result.returncode}"
-            raise RuntimeError(f"agy CLI error: {err_msg}")
-    else:
-        bin_path = shutil.which("claude") or next((p for p in CLAUDE_PATHS if Path(p).exists()), None)
-        if not bin_path:
-            raise RuntimeError("Claude executable not found")
-        result = subprocess.run(
-            [bin_path, "-p", SYSTEM_PROMPT],
-            input=user_message,
-            capture_output=True,
-            text=True,
-            timeout=300,
-            env=env,
-        )
-        output = result.stdout.strip()
-        if "hit your session limit" in output.lower():
-            raise RuntimeError("claude session limit hit; retry later")
-        if result.returncode != 0:
-            err_msg = result.stderr.strip() or f"exit code {result.returncode}"
-            raise RuntimeError(f"claude CLI error: {err_msg}")
+    output = infer(SYSTEM_PROMPT, user_message, 300)
 
     match = re.search(r"\{.*\}", output, re.DOTALL)
     if not match:
         raise RuntimeError(f"Model returned no JSON: {output[:200]}")
     return json.loads(match.group())
+
 
 
 # ---------------------------------------------------------------------------

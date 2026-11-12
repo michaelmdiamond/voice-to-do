@@ -1,0 +1,17 @@
+name: Security checks
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+      - run: python -m unittest test_security -v
+      - run: python -m compileall -q bee_agent.py bee_daily_reducer.py bee_review_gui.py bee_speech_profile.py bee_inference.py

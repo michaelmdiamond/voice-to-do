@@ -14,6 +14,8 @@ Usage:
 from __future__ import annotations
 
 import json
+import hmac
+import secrets
 import os
 import sys
 import threading
@@ -130,6 +132,7 @@ CANDIDATE_DIR = Path(__file__).parent / ".bee_candidates"
 def remove_from_candidates(task_text: str, date_str: str) -> bool:
     """Remove a task from the candidates file. Checks the conversation date first,
     then scans all candidate files as a fallback."""
+    validated_date(date_str)
     if not CANDIDATE_DIR.exists():
         return False
     primary = CANDIDATE_DIR / f"{date_str}.jsonl"
@@ -199,10 +202,25 @@ def load_all_labels() -> dict[str, dict]:
     return labels
 
 
+def validated_date(value: str) -> str:
+    if not isinstance(value, str) or not _RE.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
+        raise ValueError("Invalid date")
+    datetime.strptime(value, "%Y-%m-%d")
+    return value
+
+
+def label_path(date_str: str) -> Path:
+    target = (LABEL_DIR / f"{validated_date(date_str)}.jsonl").resolve()
+    if target.parent != LABEL_DIR.resolve():
+        raise ValueError("Invalid label path")
+    return target
+
+
 def append_label(date_str: str, record: dict) -> None:
-    LABEL_DIR.mkdir(parents=True, exist_ok=True)
-    path = LABEL_DIR / f"{date_str}.jsonl"
-    with path.open("a") as f:
+    path = label_path(date_str)
+    LABEL_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+    fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | getattr(os, 'O_NOFOLLOW', 0), 0o600)
+    with os.fdopen(fd, "a") as f:
         f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
@@ -336,18 +354,35 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt: str, *args: object) -> None:
         pass  # suppress access logs
 
+    def authorized(self, require_token: bool = True) -> bool:
+        port = self.server.server_address[1]
+        allowed = {f"127.0.0.1:{port}", f"localhost:{port}"}
+        host = self.headers.get("Host", "")
+        origin = self.headers.get("Origin")
+        if host not in allowed or (origin and origin != f"http://{host}"):
+            self.send_json({"error": "Forbidden origin"}, 403)
+            return False
+        expected = "Bearer " + getattr(self.server, "security_token", "")
+        supplied = self.headers.get("Authorization", "")
+        if require_token and (not getattr(self.server, "security_token", "") or not hmac.compare_digest(supplied, expected)):
+            self.send_json({"error": "Open the authenticated URL printed by Bee Review"}, 401)
+            return False
+        return True
+
     def send_json(self, data: object, status: int = 200) -> None:
         body = json.dumps(data, ensure_ascii=False).encode()
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
-        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(body)
 
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
         path   = parsed.path
+        if not self.authorized(require_token=path != "/"):
+            return
 
         if path == "/":
             body = HTML_APP.encode()
@@ -371,14 +406,29 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json({"error": "not found"}, 404)
 
     def do_POST(self) -> None:
+        if not self.authorized():
+            return
+        if self.headers.get("Content-Type", "").split(";")[0] != "application/json":
+            self.send_json({"error": "Expected JSON"}, 415)
+            return
         parsed = urlparse(self.path)
         if parsed.path == "/api/label":
-            length = int(self.headers.get("Content-Length", 0))
-            body   = self.rfile.read(length)
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+            except ValueError:
+                self.send_json({"error": "Invalid length"}, 400)
+                return
+            if not 0 < length <= 65536:
+                self.send_json({"error": "Invalid request size"}, 413)
+                return
+            body = self.rfile.read(length)
             try:
                 payload  = json.loads(body)
-                date_str = payload.get("date_str", "unknown")
+                date_str = validated_date(payload.get("date_str", ""))
+                label_path(date_str)  # Validate containment before any Todoist/candidate side effects.
                 record   = payload.get("record", {})
+                if not isinstance(record, dict):
+                    raise ValueError("Invalid record")
                 record["reviewed_at"] = datetime.now(timezone.utc).isoformat()
                 todoist_completed = False
                 candidate_removed = False
@@ -391,16 +441,12 @@ class Handler(BaseHTTPRequestHandler):
                 append_label(date_str, record)
                 self.send_json({"ok": True, "todoist_completed": todoist_completed, "candidate_removed": candidate_removed})
             except Exception as e:
-                self.send_json({"error": str(e)}, 400)
+                self.send_json({"error": "Invalid label request"}, 400)
         else:
             self.send_json({"error": "not found"}, 404)
 
     def do_OPTIONS(self) -> None:
-        self.send_response(200)
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type")
-        self.end_headers()
+        self.send_json({"error": "Cross-origin access is not allowed"}, 403)
 
 
 # ---------------------------------------------------------------------------
@@ -649,6 +695,16 @@ HTML_APP = """<!DOCTYPE html>
 </div>
 
 <script>
+const suppliedToken = new URLSearchParams(location.hash.slice(1)).get('token');
+if (suppliedToken) {
+  sessionStorage.setItem('bee-review-token', suppliedToken);
+  history.replaceState(null, '', location.pathname);
+}
+function apiFetch(path, options = {}) {
+  const headers = new Headers(options.headers || {});
+  headers.set('Authorization', 'Bearer ' + (sessionStorage.getItem('bee-review-token') || ''));
+  return fetch(path, { ...options, headers });
+}
 let DATA = { conversations: [], total: 0, labeled: 0 };
 let LABELS = {};   // label_key → {action, ...}
 let activeIdx = null;
@@ -656,7 +712,7 @@ let activeIdx = null;
 // ── Fetch & render ──────────────────────────────────────────────────────────
 
 async function init() {
-  const res  = await fetch('/api/data');
+  const res  = await apiFetch('/api/data');
   DATA       = await res.json();
 
   // seed LABELS from server data
@@ -897,7 +953,7 @@ async function saveLabel(date_str, conv_id, task, extra) {
     was_staged:        task.staged,
     ...extra,
   };
-  const resp = await fetch('/api/label', {
+  const resp = await apiFetch('/api/label', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ date_str, record }),
@@ -925,7 +981,7 @@ async function saveLabel(date_str, conv_id, task, extra) {
 // ── Stats modal ──────────────────────────────────────────────────────────────
 
 async function openStats() {
-  const res   = await fetch('/api/stats');
+  const res   = await apiFetch('/api/stats');
   const stats = await res.json();
   const el    = document.getElementById('stats-content');
   const pct   = n => stats.total ? Math.round(100 * n / stats.total) + '%' : '—';
@@ -1012,7 +1068,8 @@ def main() -> None:
             Handler.config["date_filter"] = args[i + 1]
 
     server = HTTPServer(("127.0.0.1", port), Handler)
-    url    = f"http://localhost:{port}"
+    server.security_token = secrets.token_urlsafe(32)
+    url = f"http://localhost:{port}/#token={server.security_token}"
     print(f"Bee Review  →  {url}")
     print("Ctrl-C to stop\n")
 

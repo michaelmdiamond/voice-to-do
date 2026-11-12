@@ -45,3 +45,11 @@ This repository contains **code only**. Everything the pipeline captures or deri
 ## License
 
 MIT — see [`LICENSE`](LICENSE).
+
+## Security boundaries
+
+Open Bee Review using the URL printed at startup. Its fragment contains a per-process session token; the UI keeps it in sessionStorage and authenticates API calls. Restarting the server invalidates old browser sessions. The server remains loopback-only, rejects foreign origins, and validates label dates before any Todoist action.
+
+Transcript reasoning now always uses the Claude subscription CLI with tools, MCP servers, hooks, skills, and session persistence disabled. Existing agy/Gemini/consensus selections fall back to this tool-free Claude path because the installed agy CLI has no verified equivalent tool-disable switch. This preserves subscription billing and the existing task evidence gates; multi-provider consensus is intentionally unavailable until it can be isolated safely. No provider or task-service API keys are inherited by the inference process.
+
+Run python3 -m unittest test_security -v before release. Existing runtime data and .env stay outside version control.

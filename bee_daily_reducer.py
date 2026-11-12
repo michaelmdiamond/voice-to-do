@@ -9,7 +9,9 @@ Todoist create list. This is the only default path that creates new Bee tasks.
 Requires: bee proxy at http://127.0.0.1:8787, TODOIST_API_TOKEN in .env
 Schedule: ~/Library/LaunchAgents/com.michael.bee-daily-reducer.plist
 """
-from __future__ import annotations  # PEP 604 (X | Y) hints work on the 3.9 system interpreter
+from __future__ import annotations
+
+from bee_inference import infer  # PEP 604 (X | Y) hints work on the 3.9 system interpreter
 
 import argparse
 import hashlib
@@ -306,65 +308,12 @@ def get_env_dict() -> dict[str, str]:
 
 
 def call_llm(payload: dict, force_provider: str | None = None) -> dict:
-    provider = force_provider or (load_env("BEE_LLM_MODE") or "claude").lower()
-    if provider == "consensus":
-        provider = "claude"
-
-    env = {
-        **os.environ,
-        **get_env_dict(),
-        "HOME": os.environ.get("HOME", "/Users/michael"),
-        "PATH": ":".join([
-            "/Users/michael/.local/bin",
-            "/Users/michael/.npm-global/bin",
-            "/opt/homebrew/bin",
-            "/usr/local/bin",
-            "/usr/bin",
-            "/bin",
-        ]),
-    }
-
-    user_message = json.dumps(payload, indent=2, ensure_ascii=False)
-
-    if provider in ("gemini", "agy"):
-        bin_path = shutil.which("agy") or next((p for p in AGY_PATHS if Path(p).exists()), None)
-        if not bin_path:
-            raise RuntimeError("Gemini/Agy executable not found")
-        combined_prompt = f"{SYSTEM_PROMPT}\n\nINPUT DATA:\n{user_message}"
-        result = subprocess.run(
-            [bin_path, "--dangerously-skip-permissions", "-p", combined_prompt],
-            capture_output=True,
-            text=True,
-            timeout=180,
-            env=env,
-        )
-        output = result.stdout.strip()
-        if result.returncode != 0:
-            err_msg = result.stderr.strip() or f"exit code {result.returncode}"
-            raise RuntimeError(f"agy CLI error: {err_msg}")
-    else:
-        bin_path = shutil.which("claude") or next((p for p in CLAUDE_PATHS if Path(p).exists()), None)
-        if not bin_path:
-            raise RuntimeError("Claude executable not found")
-        result = subprocess.run(
-            [bin_path, "-p", SYSTEM_PROMPT],
-            input=user_message,
-            capture_output=True,
-            text=True,
-            timeout=180,
-            env=env,
-        )
-        output = result.stdout.strip()
-        if "hit your session limit" in output.lower():
-            raise RuntimeError("claude session limit hit; retry later")
-        if result.returncode != 0:
-            err_msg = result.stderr.strip() or f"exit code {result.returncode}"
-            raise RuntimeError(f"claude CLI error: {err_msg}")
-
+    output = infer(SYSTEM_PROMPT, json.dumps(payload, indent=2, ensure_ascii=False), 180)
     match = re.search(r"\{.*\}", output, re.DOTALL)
     if not match:
         raise RuntimeError(f"Model returned no JSON: {output[:200]}")
     return json.loads(match.group())
+
 
 
 def reconcile_reduction(payload: dict, res_c: dict, res_g: dict) -> dict:
@@ -397,64 +346,19 @@ Respond ONLY with valid JSON in the format:
   "summary": "Brief explanation of how you resolved discrepancies."
 }""" % (json.dumps(res_c, indent=2), json.dumps(res_g, indent=2))
 
-    env = {
-        **os.environ,
-        "HOME": os.environ.get("HOME", "/Users/michael"),
-        "PATH": ":".join([
-            "/Users/michael/.local/bin",
-            "/Users/michael/.npm-global/bin",
-            "/opt/homebrew/bin",
-            "/usr/local/bin",
-            "/usr/bin",
-            "/bin",
-        ]),
-    }
-    
-    user_message = f"INPUT CANDIDATES & CONTEXT:\n{json.dumps(payload, indent=2, ensure_ascii=False)}"
-
-    # Run on Gemini to save Claude credits, fallback to Claude
-    for provider in ("gemini", "claude"):
-        try:
-            if provider in ("gemini", "agy"):
-                bin_path = shutil.which("agy") or next((p for p in AGY_PATHS if Path(p).exists()), None)
-                if not bin_path:
-                    continue
-                combined_prompt = f"{reconcile_prompt}\n\n{user_message}"
-                result = subprocess.run(
-                    [bin_path, "--dangerously-skip-permissions", "-p", combined_prompt],
-                    capture_output=True,
-                    text=True,
-                    timeout=180,
-                    env=env,
-                )
-                output = result.stdout.strip()
-            else:
-                bin_path = shutil.which("claude") or next((p for p in CLAUDE_PATHS if Path(p).exists()), None)
-                if not bin_path:
-                    continue
-                result = subprocess.run(
-                    [bin_path, "-p", reconcile_prompt],
-                    input=user_message,
-                    capture_output=True,
-                    text=True,
-                    timeout=180,
-                    env=env,
-                )
-                output = result.stdout.strip()
-
-            m = re.search(r"\{.*\}", output, re.DOTALL)
-            if m:
-                return json.loads(m.group())
-        except Exception as e:
-            print(f"  [reconciliation] reducer failed with {provider}: {e}", file=sys.stderr)
-            continue
-
-    print("  [reconciliation] all providers failed, falling back to Claude decisions", file=sys.stderr)
+    try:
+        output = infer(reconcile_prompt, json.dumps(payload, indent=2, ensure_ascii=False), 180)
+        match = re.search(r"\{.*\}", output, re.DOTALL)
+        if match:
+            return json.loads(match.group())
+    except Exception:
+        print("  [reconciliation] unavailable; retaining original decisions", file=sys.stderr)
     return res_c
 
 
+
 def call_claude(payload: dict) -> dict:
-    mode = (load_env("BEE_LLM_MODE") or "claude").lower()
+    mode = "claude"  # Tool-free subscription inference; agy has no equivalent tool-off mode.
     if mode == "consensus":
         print("  [reducer] Running consensus mode (Claude + Gemini)...", file=sys.stderr)
         res_c, res_g = {}, {}
